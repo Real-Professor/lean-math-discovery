@@ -1,0 +1,13 @@
+[
+  {
+    "conjecture_id": "CONJ_2026_002_REFUTED",
+    "informal_statement": "For any odd integer n > 1, 2^(n-1) \u2261 1 (mod n).",
+    "falsified_at": {
+      "n": 9,
+      "evaluated_left": 256,
+      "evaluated_right": 1,
+      "modulus": 9,
+      "discrepancy": "2**(n-1) % 9 = 4 != 1"
+    }
+  }
+]

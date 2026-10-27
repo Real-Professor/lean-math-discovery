@@ -1,0 +1,34 @@
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Vector Database (Local ChromaDB store)
+chroma_db/
+
+# Lean 4 & Lake Build Artifacts (Dependencies & Mathlib cache)
+.lake/
+math_discovery/.lake/
+_temp_eval_*.lean
+*.olean
+*.ilean
+*.c
+
+# Environment Variables & Secrets
+.env
+*.env
+*.env.*
+*.local
+
+# IDE & OS Metadata
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

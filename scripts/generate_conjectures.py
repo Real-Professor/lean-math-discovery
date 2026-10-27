@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""
+scripts/generate_conjectures.py
+Generate mathematical candidate conjectures in Elementary Number Theory using ChromaDB context retrieval.
+"""
+
+import argparse
+import json
+import os
+import sys
+import uuid
+import datetime
+import chromadb
+
+
+def retrieve_rag_context(db_dir: str, query: str, top_k: int = 3, collection_name: str = "number_theory_kb"):
+    """Queries ChromaDB to retrieve relevant seed theorem context."""
+    if not os.path.exists(db_dir):
+        print(f"Warning: ChromaDB directory '{db_dir}' not found. Run scripts/index_kb.py first.", file=sys.stderr)
+        return []
+
+    try:
+        client = chromadb.PersistentClient(path=db_dir)
+        collection = client.get_collection(name=collection_name)
+        results = collection.query(query_texts=[query], n_results=top_k)
+        
+        context_seeds = []
+        if results and results.get("ids") and results["ids"][0]:
+            for i in range(len(results["ids"][0])):
+                meta = results["metadatas"][0][i]
+                context_seeds.append({
+                    "id": results["ids"][0][i],
+                    "concept_name": meta.get("concept_name"),
+                    "subtopic": meta.get("subtopic"),
+                    "informal_statement": meta.get("informal_statement"),
+                    "lean4_signature": meta.get("lean4_signature")
+                })
+        return context_seeds
+    except Exception as e:
+        print(f"Error querying ChromaDB: {e}", file=sys.stderr)
+        return []
+
+
+def generate_llm_openai(prompt: str, seed_ids: list, strategy: str, count: int):
+    """Invokes OpenAI API to generate structured conjectures."""
+    from openai import OpenAI
+    client = OpenAI()
+    
+    system_prompt = (
+        "You are an expert mathematical AI system specializing in Elementary Number Theory. "
+        "Generate creative, novel, non-trivial candidate mathematical conjectures based on seed context. "
+        "Each output MUST be a JSON array of objects adhering strictly to this schema:\n"
+        "[\n"
+        "  {\n"
+        '    "conjecture_id": "CONJ_2026_XXX",\n'
+        '    "generation_strategy": "...",\n'
+        '    "seed_ids_used": ["..."],\n'
+        '    "informal_statement": "If ... then ...",\n'
+        '    "test_variables": [ {"name": "p", "type": "int", "constraints": "is_prime(p) and p > 3"} ],\n'
+        '    "verification_status": "unverified",\n'
+        '    "counterexample": null,\n'
+        '    "tested_bound": 0,\n'
+        '    "lean4_statement": "theorem ...",\n'
+        '    "proof_status": "unverified",\n'
+        '    "compiler_errors": []\n'
+        "  }\n"
+        "]"
+    )
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"}
+    )
+    
+    content = response.choices[0].message.content
+    data = json.loads(content)
+    if isinstance(data, list):
+        return data
+    elif isinstance(data, dict) and "conjectures" in data:
+        return data["conjectures"]
+    elif isinstance(data, dict):
+        return [data]
+    return []
+
+
+def generate_fallback_conjectures(strategy: str, seeds: list, count: int):
+    """Fallback generator producing valid structured Elementary Number Theory candidate conjectures for testing."""
+    timestamp = datetime.datetime.now().strftime("%H%M%S")
+    seed_ids = [s["id"] for s in seeds] if seeds else ["KB_NT_001"]
+
+    candidate_templates = [
+        {
+            "informal_statement": "For any prime p > 3, p^2 - 1 is divisible by 24.",
+            "test_variables": [
+                {"name": "p", "type": "int", "constraints": "is_prime(p) and p > 3"}
+            ],
+            "lean4_statement": "theorem prime_sq_sub_one_mod_24 (p : ℕ) (hp : Nat.Prime p) (hgt : p > 3) : 24 ∣ (p^2 - 1)"
+        },
+        {
+            "informal_statement": "For any odd prime p, 2^(p-1) ≡ 1 (mod p).",
+            "test_variables": [
+                {"name": "p", "type": "int", "constraints": "is_prime(p) and p % 2 != 0"}
+            ],
+            "lean4_statement": "theorem pow_two_sub_one_mod_prime (p : ℕ) (hp : Nat.Prime p) (hodd : p % 2 = 1) : 2^(p-1) ≡ 1 [MOD p]"
+        },
+        {
+            "informal_statement": "If a and b are coprime positive integers, then a^(Nat.totient b) + b^(Nat.totient a) ≡ 1 (mod a*b) is false in general, but a^(Nat.totient b) ≡ 1 (mod b).",
+            "test_variables": [
+                {"name": "a", "type": "int", "constraints": "a > 1"},
+                {"name": "b", "type": "int", "constraints": "b > 1 and gcd(a,b) == 1"}
+            ],
+            "lean4_statement": "theorem euler_totient_coprime (a b : ℕ) (h : Nat.Coprime a b) : a ^ (Nat.totient b) ≡ 1 [MOD b]"
+        },
+        {
+            "informal_statement": "For any integer n > 1, the sum of all positive integers less than n and coprime to n is n * φ(n) / 2.",
+            "test_variables": [
+                {"name": "n", "type": "int", "constraints": "n > 1"}
+            ],
+            "lean4_statement": "theorem sum_coprime_eq_totient_mul (n : ℕ) (hn : n > 1) : 2 * (Nat.sum_coprime n) = n * Nat.totient n"
+        },
+        {
+            "informal_statement": "For any natural number n, n^5 - n is always divisible by 30.",
+            "test_variables": [
+                {"name": "n", "type": "int", "constraints": "n >= 0"}
+            ],
+            "lean4_statement": "theorem pow_five_sub_self_dvd_30 (n : ℕ) : 30 ∣ (n^5 - n)"
+        }
+    ]
+
+    conjectures = []
+    for i in range(min(count, len(candidate_templates))):
+        tmpl = candidate_templates[i]
+        conj_id = f"CONJ_2026_{timestamp}_{i+1:03d}"
+        conjectures.append({
+            "conjecture_id": conj_id,
+            "generation_strategy": strategy,
+            "seed_ids_used": seed_ids,
+            "informal_statement": tmpl["informal_statement"],
+            "test_variables": tmpl["test_variables"],
+            "verification_status": "unverified",
+            "counterexample": None,
+            "tested_bound": 0,
+            "lean4_statement": tmpl["lean4_statement"],
+            "proof_status": "unverified",
+            "compiler_errors": []
+        })
+
+    return conjectures
+
+
+def main():
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    if hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+    parser = argparse.ArgumentParser(description="Generate structured candidate conjectures using ChromaDB context retrieval.")
+    parser.add_argument("--strategy", type=str, default="rag_retrieval", choices=["rag_retrieval", "from_definitions", "from_examples"], help="Conjecture generation strategy switch")
+    parser.add_argument("--query", type=str, default="modular congruences prime squares divisibility", help="Retrieval query for RAG context")
+    parser.add_argument("--db_dir", type=str, default="chroma_db", help="ChromaDB vector store directory")
+    parser.add_argument("--top_k", type=int, default=3, help="Number of seed context theorems to retrieve")
+    parser.add_argument("--count", type=int, default=3, help="Number of candidate conjectures to generate")
+    parser.add_argument("--output", type=str, default="conjectures_master.json", help="Output JSON file for generated conjectures")
+    parser.add_argument("--append", action="store_true", help="Append conjectures to existing output file if it exists")
+
+    args = parser.parse_args()
+
+    print(f"Executing conjecture generation [Strategy: {args.strategy}]...")
+
+    # 1. Retrieve RAG context from ChromaDB
+    seed_context = []
+    if args.strategy == "rag_retrieval":
+        seed_context = retrieve_rag_context(args.db_dir, args.query, top_k=args.top_k)
+        print(f"Retrieved {len(seed_context)} seed theorems from ChromaDB for query '{args.query}':")
+        for s in seed_context:
+            print(f"  - [{s['id']}] {s['concept_name']}: {s['informal_statement']}")
+
+    # 2. Generate conjectures via LLM API or structured fallback
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    conjectures = []
+    
+    if openai_key:
+        try:
+            print("Using OpenAI API for conjecture generation...")
+            prompt = f"Strategy: {args.strategy}\nQuery Context: {args.query}\nSeed Theorems:\n" + json.dumps(seed_context, indent=2) + f"\nGenerate {args.count} conjectures."
+            conjectures = generate_llm_openai(prompt, [s['id'] for s in seed_context], args.strategy, args.count)
+        except Exception as e:
+            print(f"API call failed: {e}. Falling back to structured heuristic generator.", file=sys.stderr)
+            conjectures = generate_fallback_conjectures(args.strategy, seed_context, args.count)
+    else:
+        print("No OPENAI_API_KEY found in environment. Using structured heuristic generator for offline testing.")
+        conjectures = generate_fallback_conjectures(args.strategy, seed_context, args.count)
+
+    # 3. Save to output JSON file
+    existing_conjectures = []
+    if args.append and os.path.exists(args.output):
+        try:
+            with open(args.output, "r", encoding="utf-8") as f:
+                existing_conjectures = json.load(f)
+                if not isinstance(existing_conjectures, list):
+                    existing_conjectures = []
+        except Exception:
+            existing_conjectures = []
+
+    combined = existing_conjectures + conjectures
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(combined, f, indent=2)
+
+    print(f"\nGenerated {len(conjectures)} conjectures. Total stored in '{args.output}': {len(combined)}")
+    for c in conjectures:
+        print(f"\nID: {c['conjecture_id']}")
+        print(f"  Informal: {c['informal_statement']}")
+        print(f"  Lean 4: {c['lean4_statement']}")
+
+
+if __name__ == "__main__":
+    main()
