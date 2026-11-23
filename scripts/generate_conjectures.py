@@ -10,7 +10,21 @@ import os
 import sys
 import uuid
 import datetime
+from typing import Any, Dict, List, Optional
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
 import chromadb
+try:
+    from scripts.llm_client import generate_json, detect_provider
+except ImportError:
+    try:
+        from llm_client import generate_json, detect_provider
+    except ImportError:
+        generate_json = None
+        detect_provider = None
 
 
 def retrieve_rag_context(db_dir: str, query: str, top_k: int = 3, collection_name: str = "number_theory_kb"):
@@ -41,15 +55,20 @@ def retrieve_rag_context(db_dir: str, query: str, top_k: int = 3, collection_nam
         return []
 
 
-def generate_llm_openai(prompt: str, seed_ids: list, strategy: str, count: int):
-    """Invokes OpenAI API to generate structured conjectures."""
-    from openai import OpenAI
-    client = OpenAI()
-    
+def generate_llm_conjectures(
+    prompt: str,
+    seed_ids: list,
+    strategy: str,
+    count: int,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Invokes LLM API (Gemini or OpenAI) to generate structured candidate conjectures."""
     system_prompt = (
         "You are an expert mathematical AI system specializing in Elementary Number Theory. "
         "Generate creative, novel, non-trivial candidate mathematical conjectures based on seed context. "
-        "Each output MUST be a JSON array of objects adhering strictly to this schema:\n"
+        "Each output MUST be a JSON array of objects (or an object with a 'conjectures' array) adhering strictly to this schema:\n"
         "[\n"
         "  {\n"
         '    "conjecture_id": "CONJ_2026_XXX",\n'
@@ -60,30 +79,76 @@ def generate_llm_openai(prompt: str, seed_ids: list, strategy: str, count: int):
         '    "verification_status": "unverified",\n'
         '    "counterexample": null,\n'
         '    "tested_bound": 0,\n'
-        '    "lean4_statement": "theorem ...",\n'
+        '    "lean4_statement": "theorem prime_example (p : ℕ) (hp : Nat.Prime p) : ...",\n'
         '    "proof_status": "unverified",\n'
         '    "compiler_errors": []\n'
         "  }\n"
         "]"
     )
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": prompt}
-        ],
-        response_format={"type": "json_object"}
-    )
-    
-    content = response.choices[0].message.content
-    data = json.loads(content)
-    if isinstance(data, list):
-        return data
-    elif isinstance(data, dict) and "conjectures" in data:
-        return data["conjectures"]
-    elif isinstance(data, dict):
-        return [data]
+    if generate_json:
+        data, used_prov = generate_json(
+            prompt=prompt,
+            system_instruction=system_prompt,
+            provider=provider,
+            api_key=api_key,
+            model=model
+        )
+        if data is not None:
+            print(f"Generated conjectures using {used_prov}")
+            if isinstance(data, list):
+                conjs = data
+            elif isinstance(data, dict) and "conjectures" in data:
+                conjs = data["conjectures"]
+            elif isinstance(data, dict):
+                conjs = [data]
+            else:
+                conjs = []
+
+            # Normalize conjecture records
+            normalized = []
+            timestamp = datetime.datetime.now().strftime("%H%M%S")
+            for idx, c in enumerate(conjs):
+                if not isinstance(c, dict):
+                    continue
+                cid = c.get("conjecture_id") or f"CONJ_2026_{timestamp}_{idx+1:03d}"
+                c["conjecture_id"] = cid
+                c["generation_strategy"] = strategy
+                if not c.get("seed_ids_used"):
+                    c["seed_ids_used"] = seed_ids
+                c.setdefault("verification_status", "unverified")
+                c.setdefault("counterexample", None)
+                c.setdefault("tested_bound", 0)
+                c.setdefault("proof_status", "unverified")
+                c.setdefault("compiler_errors", [])
+                normalized.append(c)
+            return normalized
+
+    # Fallback to direct OpenAI only if OpenAI was requested or provider was not explicitly set to gemini
+    openai_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+    if provider in (None, "openai") and openai_key.startswith(("sk-", "sk-proj-")):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_key)
+            response = client.chat.completions.create(
+                model=model or "gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"}
+            )
+            content = response.choices[0].message.content
+            data = json.loads(content)
+            if isinstance(data, list):
+                return data
+            elif isinstance(data, dict) and "conjectures" in data:
+                return data["conjectures"]
+            elif isinstance(data, dict):
+                return [data]
+        except Exception as e:
+            print(f"Direct OpenAI generation failed: {e}", file=sys.stderr)
+
     return []
 
 
@@ -166,6 +231,9 @@ def main():
     parser.add_argument("--count", type=int, default=3, help="Number of candidate conjectures to generate")
     parser.add_argument("--output", type=str, default="conjectures_master.json", help="Output JSON file for generated conjectures")
     parser.add_argument("--append", action="store_true", help="Append conjectures to existing output file if it exists")
+    parser.add_argument("--provider", type=str, default="auto", choices=["auto", "gemini", "openai"], help="LLM provider: gemini, openai, or auto")
+    parser.add_argument("--model", type=str, default=None, help="LLM model name (e.g. gemini-3.8-flash or gpt-4o-mini)")
+    parser.add_argument("--api_key", type=str, default=None, help="Explicit API key for Gemini or OpenAI")
 
     args = parser.parse_args()
 
@@ -180,19 +248,37 @@ def main():
             print(f"  - [{s['id']}] {s['concept_name']}: {s['informal_statement']}")
 
     # 2. Generate conjectures via LLM API or structured fallback
-    openai_key = os.environ.get("OPENAI_API_KEY")
     conjectures = []
+    prov, detected_key = detect_provider(args.provider if args.provider != "auto" else None, args.api_key) if detect_provider else ("none", None)
     
-    if openai_key:
+    if prov != "none":
         try:
-            print("Using OpenAI API for conjecture generation...")
-            prompt = f"Strategy: {args.strategy}\nQuery Context: {args.query}\nSeed Theorems:\n" + json.dumps(seed_context, indent=2) + f"\nGenerate {args.count} conjectures."
-            conjectures = generate_llm_openai(prompt, [s['id'] for s in seed_context], args.strategy, args.count)
+            print(f"Connecting to {prov.upper()} API for conjecture generation...")
+            prompt = (
+                f"Strategy: {args.strategy}\n"
+                f"Query Context: {args.query}\n"
+                f"Seed Theorems:\n" + json.dumps(seed_context, indent=2) + f"\n"
+                f"Generate exactly {args.count} candidate conjectures in Elementary Number Theory. "
+                "Ensure each has informal_statement, test_variables with python-executable constraints, and lean4_statement."
+            )
+            conjectures = generate_llm_conjectures(
+                prompt=prompt,
+                seed_ids=[s['id'] for s in seed_context],
+                strategy=args.strategy,
+                count=args.count,
+                provider=prov,
+                api_key=detected_key,
+                model=args.model
+            )
         except Exception as e:
             print(f"API call failed: {e}. Falling back to structured heuristic generator.", file=sys.stderr)
-            conjectures = generate_fallback_conjectures(args.strategy, seed_context, args.count)
-    else:
-        print("No OPENAI_API_KEY found in environment. Using structured heuristic generator for offline testing.")
+            conjectures = []
+
+    if not conjectures:
+        if prov == "none":
+            print("No Gemini or OpenAI API key found in environment or arguments. Using structured fallback generator for offline testing.")
+        else:
+            print("Using structured fallback generator.")
         conjectures = generate_fallback_conjectures(args.strategy, seed_context, args.count)
 
     # 3. Save to output JSON file

@@ -1,6 +1,6 @@
 [
   {
-    "conjecture_id": "CONJ_2026_194504_001",
+    "conjecture_id": "CONJ_2026_221654_001",
     "generation_strategy": "rag_retrieval",
     "seed_ids_used": [
       "KB_NT_006",
@@ -19,12 +19,11 @@
     "counterexample": null,
     "tested_bound": 3583,
     "lean4_statement": "theorem prime_sq_sub_one_mod_24 (p : \u2115) (hp : Nat.Prime p) (hgt : p > 3) : 24 \u2223 (p^2 - 1)",
-    "proof_status": "unproved",
-    "compiler_errors": [],
-    "proof_script": "by sorry"
+    "proof_status": "unverified",
+    "compiler_errors": []
   },
   {
-    "conjecture_id": "CONJ_2026_194504_002",
+    "conjecture_id": "CONJ_2026_221654_002",
     "generation_strategy": "rag_retrieval",
     "seed_ids_used": [
       "KB_NT_006",
@@ -43,12 +42,11 @@
     "counterexample": null,
     "tested_bound": 3581,
     "lean4_statement": "theorem pow_two_sub_one_mod_prime (p : \u2115) (hp : Nat.Prime p) (hodd : p % 2 = 1) : 2^(p-1) \u2261 1 [MOD p]",
-    "proof_status": "unproved",
-    "compiler_errors": [],
-    "proof_script": "by sorry"
+    "proof_status": "unverified",
+    "compiler_errors": []
   },
   {
-    "conjecture_id": "CONJ_2026_194504_003",
+    "conjecture_id": "CONJ_2026_221654_003",
     "generation_strategy": "rag_retrieval",
     "seed_ids_used": [
       "KB_NT_006",
@@ -72,34 +70,6 @@
     "counterexample": null,
     "tested_bound": 100,
     "lean4_statement": "theorem euler_totient_coprime (a b : \u2115) (h : Nat.Coprime a b) : a ^ (Nat.totient b) \u2261 1 [MOD b]",
-    "proof_status": "unproved",
-    "compiler_errors": [],
-    "proof_script": "by sorry"
-  },
-  {
-    "conjecture_id": "CONJ_2026_002_REFUTED",
-    "generation_strategy": "theorem_neighborhood",
-    "seed_ids_used": [
-      "KB_NT_001"
-    ],
-    "informal_statement": "For any odd integer n > 1, 2^(n-1) \u2261 1 (mod n).",
-    "test_variables": [
-      {
-        "name": "n",
-        "type": "int",
-        "constraints": "n > 1 and n % 2 != 0"
-      }
-    ],
-    "verification_status": "refuted",
-    "counterexample": {
-      "n": 9,
-      "evaluated_left": 256,
-      "evaluated_right": 1,
-      "modulus": 9,
-      "discrepancy": "2**(n-1) % 9 = 4 != 1"
-    },
-    "tested_bound": 9,
-    "lean4_statement": "theorem odd_two_pow_mod (n : \u2115) (hn : n > 1) (hodd : n % 2 = 1) : 2^(n-1) \u2261 1 [MOD n]",
     "proof_status": "unverified",
     "compiler_errors": []
   }

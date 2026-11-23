@@ -17,13 +17,27 @@ import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+try:
+    from scripts.llm_client import generate_text, detect_provider
+except ImportError:
+    try:
+        from llm_client import generate_text, detect_provider
+    except ImportError:
+        generate_text = None
+        detect_provider = None
+
 
 DEFAULT_IMPORTS = [
     "import Mathlib.Data.Nat.Basic",
     "import Mathlib.Data.Nat.Prime.Basic",
     "import Mathlib.Data.Nat.ModEq",
     "import Mathlib.Data.Nat.Totient",
-    "import Mathlib.Tactic",
+    "import Mathlib.Tactic.Ring",
+    "import Mathlib.Tactic.Linarith",
 ]
 
 CORE_FALLBACK_HEADER = """
@@ -52,7 +66,7 @@ def save_conjectures(conjectures: List[Dict[str, Any]], filepath: str):
     print(f"Updated conjectures saved to '{filepath}'.")
 
 
-def run_lean_checker(lean_source: str, working_dir: Optional[str] = None, timeout: int = 25) -> Tuple[int, List[Dict[str, Any]], str]:
+def run_lean_checker(lean_source: str, working_dir: Optional[str] = None, timeout: int = 90) -> Tuple[int, List[Dict[str, Any]], str]:
     """
     Invokes the Lean 4 compiler on the provided source code string with --json output.
     Returns (return_code, diagnostic_messages_list, raw_stderr).
@@ -70,9 +84,9 @@ def run_lean_checker(lean_source: str, working_dir: Optional[str] = None, timeou
     try:
         cmd = ["lean", "--json", temp_lean_path]
         
-        # If a lakefile exists in working_dir, execute inside lake env
+        # If a lakefile exists in working_dir, execute inside lake env using cwd
         if working_dir and (os.path.exists(os.path.join(working_dir, "lakefile.toml")) or os.path.exists(os.path.join(working_dir, "lakefile.lean"))):
-            cmd = ["lake", "--dir", os.path.abspath(working_dir), "env", "lean", "--json", temp_lean_path]
+            cmd = ["lake", "env", "lean", "--json", temp_lean_path]
 
         try:
             proc = subprocess.run(
@@ -85,7 +99,7 @@ def run_lean_checker(lean_source: str, working_dir: Optional[str] = None, timeou
                 timeout=timeout
             )
         except subprocess.TimeoutExpired:
-            return 1, [{"severity": "warning", "data": f"Compilation timed out after {timeout}s"}], "Timeout"
+            return 1, [{"severity": "error", "data": f"Compilation timed out after {timeout}s"}], "Timeout"
 
         messages = []
         for line in proc.stdout.strip().splitlines():
@@ -109,8 +123,13 @@ def run_lean_checker(lean_source: str, working_dir: Optional[str] = None, timeou
 
 def check_mathlib_available(working_dir: Optional[str] = None) -> bool:
     """Checks whether Mathlib imports are accessible in the current Lean environment."""
-    test_code = "import Mathlib.Data.Nat.Basic\nimport Mathlib.Data.Nat.Prime.Basic\n#check Nat\n"
-    ret, msgs, _ = run_lean_checker(test_code, working_dir=working_dir)
+    if not working_dir or not os.path.exists(working_dir):
+        return False
+    pkg_mathlib = os.path.join(working_dir, ".lake", "packages", "mathlib")
+    if not os.path.exists(pkg_mathlib):
+        return False
+    test_code = "import Mathlib.Data.Nat.Basic\n#check Nat\n"
+    ret, msgs, _ = run_lean_checker(test_code, working_dir=working_dir, timeout=60)
     has_error = any(m.get("severity") == "error" for m in msgs)
     return ret == 0 and not has_error
 
@@ -125,22 +144,27 @@ def clean_statement_syntax(stmt: str) -> str:
 
 def autoformalize_with_llm(
     conjecture: Dict[str, Any],
+    provider: Optional[str] = None,
     api_key: Optional[str] = None,
+    model: Optional[str] = None,
     few_shot_seeds: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
-    Translates an informal mathematical statement into typed Lean 4 theorem declaration using LLM API.
+    Translates an informal mathematical statement into typed Lean 4 theorem declaration using LLM API (Gemini or OpenAI).
     """
     informal = conjecture.get("informal_statement", "")
     test_vars = conjecture.get("test_variables", [])
 
+    system_instruction = (
+        "You are an expert formal mathematician specializing in Lean 4 and Mathlib. "
+        "Translate informal Elementary Number Theory conjectures into valid Lean 4 theorem signatures. "
+        "Output ONLY the theorem declaration line without markdown or explanations, e.g. "
+        "'theorem prime_example (p : ℕ) (hp : Nat.Prime p) : ...' "
+        "Do NOT include proofs, ':= by', or 'sorry'."
+    )
+
     prompt = (
-        "You are an expert formal mathematician specializing in Lean 4 and Mathlib.\n"
-        "Translate the following informal Elementary Number Theory conjecture into a single, valid Lean 4 theorem signature.\n"
-        "Requirements:\n"
-        "1. Output ONLY the theorem declaration line, e.g. 'theorem <name> (<args>) : <claim>'\n"
-        "2. Do NOT include proof or ':= by' or 'sorry'.\n"
-        "3. Use typed variables such as (p : ℕ), Nat.Prime p, Nat.Coprime a b, divisibility 24 ∣ (p^2 - 1), or a ^ b ≡ 1 [MOD n].\n\n"
+        f"Translate the following informal Elementary Number Theory conjecture into a single, valid Lean 4 theorem signature.\n"
         f"Informal Statement: {informal}\n"
         f"Test Variables: {json.dumps(test_vars)}\n"
     )
@@ -150,25 +174,39 @@ def autoformalize_with_llm(
         for s in few_shot_seeds[:3]:
             prompt += f"- Informal: {s.get('informal_statement')}\n  Lean 4: {s.get('lean4_signature')}\n"
 
-    try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key) if api_key else OpenAI()
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You output only clean, valid Lean 4 theorem declarations with no markdown or formatting."},
-                {"role": "user", "content": prompt}
-            ],
+    if generate_text:
+        res, used_prov = generate_text(
+            prompt=prompt,
+            system_instruction=system_instruction,
+            provider=provider,
+            api_key=api_key,
+            model=model,
             temperature=0.0
         )
-        content = resp.choices[0].message.content.strip()
-        # Clean any markdown code blocks
-        content = re.sub(r'^```(?:lean4?|lean)?', '', content).strip()
-        content = re.sub(r'```$', '', content).strip()
-        return clean_statement_syntax(content)
-    except Exception as e:
-        print(f"Warning: LLM autoformalization call failed: {e}", file=sys.stderr)
-        return None
+        if res:
+            print(f"  Autoformalized with {used_prov}")
+            return clean_statement_syntax(res)
+
+    openai_key = api_key or os.environ.get("OPENAI_API_KEY", "")
+    if provider in (None, "openai") and openai_key.startswith(("sk-", "sk-proj-")):
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=openai_key)
+            resp = client.chat.completions.create(
+                model=model or "gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.0
+            )
+            content = resp.choices[0].message.content.strip()
+            content = re.sub(r'^```(?:lean4?|lean)?', '', content).strip()
+            content = re.sub(r'```$', '', content).strip()
+            return clean_statement_syntax(content)
+        except Exception as e:
+            print(f"Warning: LLM autoformalization call failed: {e}", file=sys.stderr)
+    return None
 
 
 def attempt_proof_tactics(
@@ -188,10 +226,16 @@ def attempt_proof_tactics(
 
     # Step 1: Syntactic & Type Elaboration check using 'sorry'
     test_sorry_source = f"{header}{stmt_clean} := by\n  sorry\n"
-    ret, msgs, _ = run_lean_checker(test_sorry_source, working_dir=working_dir)
+    ret, msgs, stderr = run_lean_checker(test_sorry_source, working_dir=working_dir)
 
     errors = [m.get("data", "") for m in msgs if m.get("severity") == "error"]
     if errors or ret != 0:
+        if not errors:
+            errors = [m.get("data", "") for m in msgs if m.get("data")]
+            if not errors and stderr:
+                errors = [stderr.strip()]
+            if not errors:
+                errors = [f"Compilation failed with exit code {ret}"]
         if verbose:
             print(f"  Elaboration/Type Error: {errors}", flush=True)
         return "type_error", None, errors
@@ -226,6 +270,9 @@ def process_autoformalization(
     target_id: Optional[str] = None,
     working_dir: Optional[str] = None,
     use_llm: bool = False,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
     verbose: bool = False
 ):
     """Orchestrates Phase 4: autoformalization and proof verification loop."""
@@ -258,7 +305,12 @@ def process_autoformalization(
         lean_stmt = c.get("lean4_statement")
         if (not lean_stmt or use_llm) and use_llm:
             print("  Querying LLM for autoformalization...", flush=True)
-            new_stmt = autoformalize_with_llm(c)
+            new_stmt = autoformalize_with_llm(
+                c,
+                provider=provider,
+                api_key=api_key,
+                model=model
+            )
             if new_stmt:
                 lean_stmt = new_stmt
                 c["lean4_statement"] = new_stmt
@@ -332,6 +384,9 @@ def main():
     parser.add_argument("--use_llm", action="store_true", help="Use LLM API to autoformalize or re-formalize statements")
     parser.add_argument("--target_id", type=str, default=None, help="Target specific conjecture ID")
     parser.add_argument("--tactics", type=str, default="omega,ring,decide,rfl,linarith,aesop", help="Comma-separated proof tactics to try")
+    parser.add_argument("--provider", type=str, default="auto", choices=["auto", "gemini", "openai"], help="LLM provider: gemini, openai, or auto")
+    parser.add_argument("--model", type=str, default=None, help="LLM model name (e.g. gemini-3.8-flash or gpt-4o-mini)")
+    parser.add_argument("--api_key", type=str, default=None, help="Explicit API key for Gemini or OpenAI")
     parser.add_argument("--verbose", action="store_true", help="Print verbose compiler diagnostics")
 
     args = parser.parse_args()
@@ -351,6 +406,9 @@ def main():
         target_id=args.target_id,
         working_dir=working_dir,
         use_llm=args.use_llm,
+        provider=args.provider if args.provider != "auto" else None,
+        api_key=args.api_key,
+        model=args.model,
         verbose=args.verbose
     )
 
